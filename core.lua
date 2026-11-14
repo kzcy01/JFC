@@ -533,6 +533,19 @@ function ACT.fuse()
     end
     local a, b = pets[1], pets[2]
     if not (a.uid and b.uid) then return 0 end
+    -- cut the machine's charge-up visuals; pure client-side, server unaffected
+    pcall(function()
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("Model") and d.Name == "FuseMachine" then
+                for _, c in ipairs(d:GetDescendants()) do
+                    if c:IsA("ParticleEmitter") or c:IsA("Beam") or c:IsA("Trail") then
+                        if c.Enabled then c.Enabled = false end
+                    end
+                end
+                break
+            end
+        end
+    end)
     local ok2, res = pcall(function() return fr:InvokeServer({ a.uid, b.uid }) end)
     if ok2 and type(res) == "table" and res.ok == true then
         FUSE_TRIP_UNTIL = os.clock() + 8
