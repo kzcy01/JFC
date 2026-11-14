@@ -385,72 +385,83 @@ function ACT.placeBest()
     HITS.place = HITS.place + 1
 end
 
+local WMULT = { K = 1e3, M = 1e6, B = 1e9, T = 1e12, Qa = 1e15, Qi = 1e18,
+                Sp = 1e21, Sx = 1e21, S = 1e21, Oc = 1e27, No = 1e30, Dc = 1e33, p = 1e24 }
 local function parseNum(s)
-    local n, suf = string.match(tostring(s), "([%d%.]+)%s*([KMBTQaSp]*)")
+    local n, suf = string.match(tostring(s), "([%d%.]+)%s*([KMBTQaSpOxNocD]*)")
     if not n then return 0 end
-    local v = tonumber(n) or 0
-    local mult = ({ K = 1e3, M = 1e6, B = 1e9, T = 1e12, Qa = 1e15, Qi = 1e18, Sp = 1e21, S = 1e21, p = 1e24 })[suf] or 1
-    return v * mult
+    return (tonumber(n) or 0) * (WMULT[suf] or 1)
 end
 
 function ACT.buyWeight()
-    local sf = frame("Game", "Frames", "WeightUI", "ScrollingFrame")
-    if not sf then return false end
-    local cash = S.cash()
-    local cards = {}
-    for _, card in ipairs(sf:GetChildren()) do
-        if card:IsA("GuiObject") and string.find(card.Name, "WeightCard_") then
-            local pl = card:FindFirstChild("PowerLabel", true)
-            local btn = card:FindFirstChild("InteractButton", true)
-            if pl and btn then
-                local tl = btn:FindFirstChildOfClass("TextLabel")
-                local txt = tl and tl.Text or ""
-                cards[#cards + 1] = {
-                    name = card.Name,
-                    power = parseNum(pl.Text),
-                    price = string.find(txt, "%$") and parseNum(txt) or nil,
-                    state = txt,
-                    btn = btn,
-                }
-            end
+    -- server-truth weights: config gives exact StrengthGain/Price per item,
+    -- SoldInWorld filters to this world's stock, and a passive state-sync
+    -- listener tells us owned + equipped. no shop UI reading at all --
+    -- the cards lie when the shop is closed and miss suffixes anyway.
+    local okW, W = pcall(require, RS:FindFirstChild("WeightsConfig"))
+    if not okW or type(W) ~= "table" or type(W.Weights) ~= "table" then return false end
+    if WSTATE_REFRESH == nil then WSTATE_REFRESH = false end
+    if not WSTATE_REFRESH then
+        WSTATE_REFRESH = true
+        local r = R:FindFirstChild("WeightShopStateSync")
+        if r then
+            r.OnClientEvent:Connect(function(s)
+                if type(s) == "table" then
+                    if type(s.owned) == "table" then WSTATE_OWNED = s.owned end
+                    if s.equipped ~= nil then WSTATE_EQUIPPED = s.equipped end
+                end
+            end)
         end
     end
-    if #cards == 0 then return false end
-
-    -- 1) buy the highest-power card we can actually afford
-    local buy = nil
-    for _, c in ipairs(cards) do
-        if c.price and c.price > 0 and cash >= c.price then
-            if not buy or c.power > buy.power then buy = c end
+    if not WSTATE_OWNED then
+        -- one no-op equip to make the server push a full state sync
+        local r = R:FindFirstChild("RequestEquipWeight")
+        if r then
+            pcall(function() r:FireServer({ key = WSTATE_EQUIPPED or "Wooden Stick" }) end)
+            task.wait(1.5)
+        end
+    end
+    if not WSTATE_OWNED then return false end
+    local world, cash = S.world(), S.cash()
+    local buy, buyStr = nil, 0
+    for name, e in pairs(W.Weights) do
+        if type(e) == "table" and not WSTATE_OWNED[name] then
+            local okSold, sold = pcall(function() return W.SoldInWorld(name, world) end)
+            local str, price = tonumber(e.StrengthGain) or 0, tonumber(e.Price) or math.huge
+            if okSold and sold and price <= cash and str > buyStr then
+                buy, buyStr = name, str
+            end
         end
     end
     local bought = false
     if buy then
-        bought = press(buy.btn)
-        if bought then
+        local r = R:FindFirstChild("RequestBuyWeight")
+        if r and pcall(function() r:FireServer({ key = buy }) end) then
+            bought = true
             HITS.weight = HITS.weight + 1
-            log(string.format("bought %s (%.3g)", buy.name:gsub("WeightCard_", ""), buy.power))
+            log(string.format("buying %s (%.3g)", buy, buyStr))
         end
     end
-
-    -- 2) equip best: single path only. never touches the barbell while a
-    --    combo is live (a swap wipes it), and the latch stops repeat presses
-    --    across scans, rejoins and stale label reads.
-    if not CFG.autoEquipBest then return bought end
-    if (tonumber(A("_RushCombo")) or 0) > 0 then return bought end
-    EQUIP_LATCH = EQUIP_LATCH or 0
-    local wornP, bestC, bestP = 0, nil, 0
-    for _, c in ipairs(cards) do
-        if not c.price then
-            if string.lower(c.state) == "equipped" then wornP = c.power end
-            if c.power > bestP then bestC, bestP = c, c.power end
+    -- equip the strongest owned barbell. combo-gated (a swap wipes it)
+    -- and latched (one press per power level, never repeats, never walks
+    -- back down). server answers alreadyequipped on no-ops.
+    if CFG.autoEquipBest and (tonumber(A("_RushCombo")) or 0) == 0 then
+        local best, bestStr = nil, 0
+        for name in pairs(WSTATE_OWNED) do
+            local e = W.Weights[name]
+            local str = (type(e) == "table" and tonumber(e.StrengthGain)) or 0
+            if str > bestStr then best, bestStr = name, str end
         end
-    end
-    if bestC and bestP > math.max(wornP, EQUIP_LATCH) * 1.0001 then
-        EQUIP_LATCH = bestP
-        press(bestC.btn)
-        log(string.format("equip %s (%.3g)", bestC.name:gsub("WeightCard_", ""), bestP))
-        return true
+        EQUIP_LATCH = EQUIP_LATCH or 0
+        if best and best ~= WSTATE_EQUIPPED and bestStr > EQUIP_LATCH then
+            local r = R:FindFirstChild("RequestEquipWeight")
+            if r and pcall(function() r:FireServer({ key = best }) end) then
+                EQUIP_LATCH = bestStr
+                WSTATE_EQUIPPED = best
+                log(string.format("equip %s (%.3g)", best, bestStr))
+                return true
+            end
+        end
     end
     return bought
 end
@@ -540,12 +551,7 @@ function ACT.petUpgrade()
                     local sg = slot:FindFirstChild("SurfaceGui", true)
                     local tl = sg and sg:FindFirstChild("TextLabel", true)
                     if tl then
-                        local v = 0
-                        local n, suf = string.match(tl.Text, "([%d%.]+)%s*([KMBTQaSp]?)")
-                        if n then
-                            v = (tonumber(n) or 0) * (({ K=1e3, M=1e6, B=1e9, T=1e12, Qa=1e15, Qi=1e18, Sp=1e21, S=1e21 })[suf] or 1)
-                        end
-                        pay[slot] = v
+                        pay[slot] = parseNum(tl.Text)
                     end
                 end
             end
