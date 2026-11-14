@@ -646,14 +646,23 @@ function ACT.travel(key)
     return false
 end
 
--- stay on the jump pad: one teleport at start, then walking only
-local PAD = { last = 0, snaps = 0, fails = 0, tpDone = false }
+-- jump ferry: walks to the pad, waits for the game's own launch, ferries
+-- back after landing. zero charge presses (proven useless live -- only real
+-- input or game auto-jump can charge), zero manual teleports, zero speed
+-- writes. movement is MoveTo + Jump only; returns use the game's own
+-- Tp Home button. the Jump Zone button is NEVER pressed: proven live to
+-- launch instead of recalling, which flings you around.
+local PAD = { last = 0, snaps = 0, fails = 0, tpDone = false,
+              state = "TO_PAD", since = os.clock(), loops = 0,
+              retLast = nil, retStuck = 0, lastTp = 0, lastAuto = 0,
+              offdir = 0, manualUntil = 0, cmdDir = nil, dead = false }
+local PAD_POS = Vector3.new(207.25, 23.8, 104.95)
 
 function PAD.coords()
     local raw = tostring(A("_HubTp_jumpzone") or "")
     local n = {}
     for v in string.gmatch(raw, "-?[%d%.]+") do n[#n + 1] = tonumber(v) end
-    if #n < 3 then return nil end
+    if #n < 3 then return PAD_POS end
     return Vector3.new(n[1], n[2] + 4, n[3])
 end
 
@@ -661,6 +670,176 @@ function PAD.reset()
     PAD.tpDone = false
     PAD.fails = 0
     PAD.snaps = 0
+    PAD.state, PAD.since = "TO_PAD", os.clock()
+    PAD.retLast, PAD.retStuck = nil, 0
+    PAD.offdir, PAD.manualUntil, PAD.cmdDir = 0, 0, nil
+    PAD.dead = false
+end
+
+local function distXZ(a, b)
+    local dx, dz = a.X - b.X, a.Z - b.Z
+    return math.sqrt(dx * dx + dz * dz)
+end
+
+-- water scan: slow swim zones on the pad corridor are routed around,
+-- never through. rescan periodically -- the world streams in after boot.
+local JFWATER, JFWATER_SCANNED = {}, 0
+local function scanJumpWater()
+    JFWATER = {}
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("BasePart") and string.lower(d.Name) == "water" then
+            local p, s = d.Position, d.Size
+            JFWATER[#JFWATER + 1] = {
+                x1 = math.min(p.X - s.X / 2, p.X + s.X / 2) - 4,
+                x2 = math.max(p.X - s.X / 2, p.X + s.X / 2) + 4,
+                z1 = math.min(p.Z - s.Z / 2, p.Z + s.Z / 2) - 4,
+                z2 = math.max(p.Z - s.Z / 2, p.Z + s.Z / 2) + 4,
+            }
+        end
+    end
+    JFWATER_SCANNED = os.clock()
+    return #JFWATER
+end
+
+local function inJumpWater(x, z)
+    for _, b in ipairs(JFWATER) do
+        if x > b.x1 and x < b.x2 and z > b.z1 and z < b.z2 then return b end
+    end
+    return nil
+end
+
+local JFPFS = game:GetService("PathfindingService")
+local JFPATH = { legs = nil, legIdx = 1, dest = nil, lastComp = 0 }
+
+local function jumpWalkTo(target)
+    if PAD.manualUntil and os.clock() < PAD.manualUntil then return true end
+    local c = player.Character
+    local hum = c and c:FindFirstChildOfClass("Humanoid")
+    if not (c and hum) then return false end
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    -- water first: nearest edge + jump-spam; currents can't stalemate it
+    do
+        if #JFWATER == 0 or os.clock() - JFWATER_SCANNED > 60 then scanJumpWater() end
+        local hx, hz = hrp.Position.X, hrp.Position.Z
+        local box = inJumpWater(hx, hz)
+        if box then
+            local edgeX = (math.abs(hx - box.x1) < math.abs(hx - box.x2)) and (box.x1 - 2) or (box.x2 + 2)
+            pcall(function() hum.Jump = true end)
+            pcall(function() hum:MoveTo(Vector3.new(edgeX, hrp.Position.Y, hz)) end)
+            PAD.cmdDir = { X = (edgeX > hx) and 1 or -1, Z = 0 }
+            return true
+        end
+    end
+    if not JFPATH.legs or not JFPATH.dest or (JFPATH.dest - target).Magnitude > 6
+        or os.clock() - JFPATH.lastComp > 20 or (JFPATH.legIdx or 1) > #JFPATH.legs then
+        local legs = { target }
+        local hx, hz = hrp.Position.X, hrp.Position.Z
+        for _, b in ipairs(JFWATER) do
+            local function crosses(x1, z1, x2, z2)
+                for _, t in ipairs({ 0, 0.25, 0.5, 0.75, 1 }) do
+                    local x, z = x1 + (x2 - x1) * t, z1 + (z2 - z1) * t
+                    if x > b.x1 and x < b.x2 and z > b.z1 and z < b.z2 then return true end
+                end
+                return false
+            end
+            if crosses(hx, hz, target.X, target.Z) then
+                local edgeX = (math.abs(hx - b.x1) < math.abs(hx - b.x2)) and (b.x1 - 2) or (b.x2 + 2)
+                local cornerZ = (math.abs(hz - b.z1) < math.abs(hz - b.z2)) and (b.z1 - 2) or (b.z2 + 2)
+                legs = { Vector3.new(edgeX, hrp.Position.Y, hz),
+                         Vector3.new(edgeX, hrp.Position.Y, cornerZ), target }
+                break
+            end
+        end
+        JFPATH.legs, JFPATH.legIdx, JFPATH.dest, JFPATH.lastComp = legs, 1, target, os.clock()
+    end
+    local legs, li = JFPATH.legs, JFPATH.legIdx or 1
+    while li <= #legs and (legs[li] - hrp.Position).Magnitude < 6 do li = li + 1 end
+    JFPATH.legIdx = li
+    if li > #legs then
+        pcall(function() hum:MoveTo(target) end)
+        return true
+    end
+    local leg = legs[li]
+    local ok, p = pcall(function()
+        local np = JFPFS:CreatePath({ AgentRadius = 2, AgentHeight = 5,
+            AgentCanJump = true, AgentCanClimb = false })
+        np:ComputeAsync(hrp.Position, leg)
+        return np
+    end)
+    if ok and p and p.Status == Enum.PathStatus.Success then
+        for _, wp in ipairs(p:GetWaypoints()) do
+            if (wp.Position - hrp.Position).Magnitude > 5 then
+                if wp.Action == Enum.PathWaypointAction.Jump then
+                    pcall(function() hum.Jump = true end)
+                end
+                pcall(function() hum:MoveTo(wp.Position) end)
+                do
+                    local dx, dz = wp.Position.X - hrp.Position.X, wp.Position.Z - hrp.Position.Z
+                    local m = math.sqrt(dx * dx + dz * dz)
+                    if m > 0.5 then PAD.cmdDir = { X = dx / m, Z = dz / m } end
+                end
+                return true
+            end
+        end
+    end
+    pcall(function() hum:MoveTo(leg) end)
+    do
+        local dx, dz = leg.X - hrp.Position.X, leg.Z - hrp.Position.Z
+        local m = math.sqrt(dx * dx + dz * dz)
+        if m > 0.5 then PAD.cmdDir = { X = dx / m, Z = dz / m } end
+    end
+    return true
+end
+
+-- Tp Home: the game's own one-shot return button. needs no held input,
+-- so a single synthetic press works (proven live: 371m in one press).
+local function jumpTpHome()
+    if PAD.manualUntil and os.clock() < PAD.manualUntil then return false end
+    if os.clock() - (PAD.lastTp or 0) < 10 then return false end
+    local hud = frame("Game", "HUD", "HUDFrame")
+    local tp = hud and hud:FindFirstChild("TpHome")
+    if not (tp and tp.Visible) then return false end
+    local cc = tp:FindFirstChild("ClickCatcher")
+    if not (cc and cc:IsA("GuiButton")) then return false end
+    PAD.lastTp = os.clock()
+    local ok = pcall(firesignal, cc.MouseButton1Down)
+    if not ok then pcall(firesignal, cc.Activated) end
+    return true
+end
+
+-- popup sweeper: gift / trade / invite prompts steal focus and stall the
+-- run. decline or close them the moment any becomes visible.
+local function sweepJumpPopups()
+    local frames = frame("Game", "Frames")
+    if not frames then return end
+    local gift = frames:FindFirstChild("GiftFrame")
+    if gift and gift.Visible then
+        for _, n in ipairs({ "Decline", "CloseButton" }) do
+            local b = gift:FindFirstChild(n, true)
+            if b and b:IsA("GuiButton") and b.Visible then
+                if pcall(firesignal, b.MouseButton1Click) then log("dismissed gift popup") end
+                break
+            end
+        end
+    end
+    local trade = frames:FindFirstChild("TradeRequestFrame")
+    if trade and trade.Visible then
+        for _, n in ipairs({ "CancelButton", "ExitButton" }) do
+            local b = trade:FindFirstChild(n, true)
+            if b and b:IsA("GuiButton") and b.Visible then
+                if pcall(firesignal, b.MouseButton1Click) then log("dismissed trade popup") end
+                break
+            end
+        end
+    end
+    local inv = frames:FindFirstChild("InviteFrame")
+    if inv and inv.Visible then
+        local b = inv:FindFirstChild("CloseButton", true)
+        if b and b:IsA("GuiButton") and b.Visible then
+            if pcall(firesignal, b.MouseButton1Click) then log("dismissed invite popup") end
+        end
+    end
 end
 
 -- jump pad: never moves the player. it only reacts when the game shows the jump
@@ -675,25 +854,125 @@ function PAD.meterActive()
 end
 
 function PAD.hold()
-    local active, kb = PAD.meterActive()
-    if not active then return "idle" end
-    -- meter is up: take the perfect attempt, nothing else
-    if os.clock() - (PAD.lastPress or 0) > 0.35 then
-        PAD.lastPress = os.clock()
-        pcall(firesignal, kb.Activated)
-        pcall(firesignal, kb.MouseButton1Click)
-        PAD.snaps = PAD.snaps + 1
-        return "jump"
-    end
-    return "meter"
+    -- retired: synthetic charge presses were proven useless live (bar frozen
+    -- through Click, Down-hold and VirtualUser). the game itself launches
+    -- (auto-jump or your hold); this only watches.
+    return "idle"
 end
 
 local function padLoop()
     while alive() do
         if CFG.running and CFG.autoJump then
-            local state = PAD.hold()
-            if state == "jump" then log("jump pad: perfect attempt") end
-            task.wait(0.6)
+            sweepJumpPopups()
+            local c = player.Character
+            local hum = c and c:FindFirstChildOfClass("Humanoid")
+            local hrp = c and c:FindFirstChild("HumanoidRootPart")
+            if not (c and hum and hrp) then
+                PAD.dead = true
+                task.wait(1)
+            else
+                if PAD.dead then PAD.dead = false PAD.reset() end
+                local pos = hrp.Position
+                local pad = PAD.coords() or PAD_POS
+                -- manual-drive detection: fast movement against our command
+                -- means your finger is on the keys: yield so we never fight.
+                -- skipped in water, where currents (not fingers) push back.
+                do
+                    local vel = hrp.AssemblyLinearVelocity
+                    local sp = math.sqrt(vel.X * vel.X + vel.Z * vel.Z)
+                    local wet = inJumpWater(pos.X, pos.Z) ~= nil
+                    if sp > 10 and PAD.cmdDir and not wet then
+                        local dot = (vel.X * PAD.cmdDir.X + vel.Z * PAD.cmdDir.Z) / sp
+                        if dot < 0.5 then PAD.offdir = (PAD.offdir or 0) + 1
+                        else PAD.offdir = 0 end
+                        if (PAD.offdir or 0) >= 6 then
+                            PAD.offdir = 0
+                            PAD.manualUntil = os.clock() + 20
+                            log("you drive, I'll wait")
+                        end
+                    else
+                        PAD.offdir = 0
+                    end
+                end
+                if PAD.manualUntil and os.clock() < PAD.manualUntil then
+                    task.wait(0.5)
+                elseif os.clock() - PAD.since > 45 then
+                    PAD.reset()
+                elseif PAD.state == "TO_PAD" then
+                    local d = distXZ(pos, pad)
+                    if d > 60 then
+                        if jumpTpHome() then
+                            log("Tp Home pressed")
+                            task.wait(2)
+                        else
+                            jumpWalkTo(pad)
+                        end
+                    else
+                        jumpWalkTo(pad)
+                    end
+                    if distXZ(pos, pad) <= 9 then
+                        PAD.loops = PAD.loops + 1
+                        HITS.jump = (HITS.jump or 0) + 1
+                        PAD.state, PAD.since = "ON_PAD", os.clock()
+                        log("on jump pad (loop " .. PAD.loops .. ")")
+                    end
+                elseif PAD.state == "ON_PAD" then
+                    if distXZ(pos, pad) > 15 then
+                        PAD.state, PAD.since = "TO_PAD", os.clock()
+                    else
+                        jumpWalkTo(pad)
+                        local auto = player:GetAttribute("_AutoKick")
+                        if not auto then
+                            if os.clock() - (PAD.lastAuto or 0) > 5 then
+                                PAD.lastAuto = os.clock()
+                                local hud = frame("Game", "HUD", "HUDFrame")
+                                local ak = hud and hud:FindFirstChild("AutoKickButton")
+                                if ak and ak:IsA("GuiButton") then
+                                    pcall(firesignal, ak.MouseButton1Click)
+                                end
+                                log("enabling auto-jump")
+                            end
+                        end
+                        if distXZ(pos, pad) > 40 or pos.Y > pad.Y + 40 then
+                            PAD.state, PAD.since = "AIRBORNE", os.clock()
+                            log("launched!")
+                        end
+                    end
+                elseif PAD.state == "AIRBORNE" then
+                    if distXZ(pos, pad) > 40 then
+                        PAD.state, PAD.since = "RIDING", os.clock()
+                    elseif os.clock() - PAD.since > 12 then
+                        PAD.state, PAD.since = "TO_PAD", os.clock()
+                    end
+                elseif PAD.state == "RIDING" then
+                    local floored = hum.FloorMaterial ~= Enum.Material.Air
+                    if (floored and os.clock() - PAD.since > 3) or pos.Y < 60 then
+                        PAD.state, PAD.since = "CHEST", os.clock()
+                    elseif os.clock() - PAD.since > 40 then
+                        PAD.state, PAD.since = "CHEST", os.clock()
+                    end
+                elseif PAD.state == "CHEST" then
+                    if os.clock() - PAD.since > 2.5 then
+                        PAD.state, PAD.since = "RETURN", os.clock()
+                    end
+                elseif PAD.state == "RETURN" then
+                    local d = distXZ(pos, pad)
+                    if d > 60 then
+                        if jumpTpHome() then
+                            log("Tp Home pressed")
+                            task.wait(2)
+                        else
+                            jumpWalkTo(pad)
+                        end
+                    else
+                        jumpWalkTo(pad)
+                    end
+                    if d <= 9 then
+                        PAD.state, PAD.since = "TO_PAD", os.clock()
+                    end
+                end
+                task.wait(0.3)
+            end
         else
             PAD.tpDone = false
             task.wait(1.0)
