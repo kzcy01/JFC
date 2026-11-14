@@ -17,6 +17,12 @@ for _, g in ipairs(playerGui:GetChildren()) do
     if g.Name == "JFC" or g.Name == "JFC_OSU" then pcall(function() g:Destroy() end) end
 end
 
+-- hot-reload guard: re-executing this file bumps the generation and all
+-- old loop threads see the mismatch and exit instead of stacking.
+getgenv().JFC_GEN = (getgenv().JFC_GEN or 0) + 1
+local MYGEN = getgenv().JFC_GEN
+local function alive() return MYGEN == getgenv().JFC_GEN end
+
 -- ============ config ============
 local CFG = {
     -- throw
@@ -290,7 +296,7 @@ function MSG.watch()
         end
     end
     task.spawn(function()
-        while true do
+        while alive() do
             if CFG.suppressMessages then MSG.kill() end
             task.wait(0.25)
         end
@@ -427,21 +433,23 @@ function ACT.buyWeight()
         end
     end
 
-    -- 2) equipis opt-in only. swapping mid-combo costs more than it gains,
-    --    and the shop toggles state confusingly, so this never runs by default.
-    -- forward-only upgrade: one barbell at a time, never downgrade, never re-pick.
-    -- a swap resets the combo so this only ever moves upward.
-    -- equip: never. the shop's Equip/Equipped labels repaint out of order and any
-    -- press swaps the barbell and wipes the combo. buying only.
-    BEST_POWER = BEST_POWER or 0
-    local top, topP = nil, 0
+    -- 2) equip best: single path only. never touches the barbell while a
+    --    combo is live (a swap wipes it), and the latch stops repeat presses
+    --    across scans, rejoins and stale label reads.
+    if not CFG.autoEquipBest then return bought end
+    if (tonumber(A("_RushCombo")) or 0) > 0 then return bought end
+    EQUIP_LATCH = EQUIP_LATCH or 0
+    local wornP, bestC, bestP = 0, nil, 0
     for _, c in ipairs(cards) do
-        if not c.price and c.power > topP then top, topP = c, c.power end
+        if not c.price then
+            if string.lower(c.state) == "equipped" then wornP = c.power end
+            if c.power > bestP then bestC, bestP = c, c.power end
+        end
     end
-    if top and topP > BEST_POWER then
-        BEST_POWER = topP
-        press(top.btn)
-        log(string.format("upgraded to %s (%.3g)", top.name:gsub("WeightCard_", ""), topP))
+    if bestC and bestP > math.max(wornP, EQUIP_LATCH) * 1.0001 then
+        EQUIP_LATCH = bestP
+        press(bestC.btn)
+        log(string.format("equip %s (%.3g)", bestC.name:gsub("WeightCard_", ""), bestP))
         return true
     end
     return bought
@@ -513,19 +521,22 @@ function ACT.petUpgrade()
     local plotName = "Plot" .. tostring(A("BasePlot") or "")
     local mine = plots and (plots:FindFirstChild(plotName) or plots:FindFirstChild("Plot" .. tostring(A("BasePlot"))))
     if not mine then
-        fire("BasePetsRequest", "PlaceBest")
+        if CFG.autoPlaceBest then fire("BasePetsRequest", "PlaceBest") end
         HITS.pet = HITS.pet + 1
         return 0
     end
 
-    -- map each floor slot to the payout shown on it
+    -- rank slots two ways: the payout shown on the slot, and (when that reads $0)
+    -- the pet's own stat from the server, strongest first.
     local pay = {}
+    local slotList = {}
     local floors = mine:FindFirstChild("Floors")
     if floors then
         for _, fl in ipairs(floors:GetChildren()) do
             local sm = fl:FindFirstChild("SlotModels")
             if sm then
                 for _, slot in ipairs(sm:GetChildren()) do
+                    slotList[#slotList + 1] = slot
                     local sg = slot:FindFirstChild("SurfaceGui", true)
                     local tl = sg and sg:FindFirstChild("TextLabel", true)
                     if tl then
@@ -536,6 +547,23 @@ function ACT.petUpgrade()
                         end
                         pay[slot] = v
                     end
+                end
+            end
+        end
+    end
+
+    -- if the slot labels are empty, use the server's pet stats instead
+    local anyPay = false
+    for _, v in pairs(pay) do if v > 0 then anyPay = true break end end
+    if not anyPay then
+        local fr = R:FindFirstChild("FuseGetPets")
+        if fr then
+            local okp, pets = pcall(function() return fr:InvokeServer() end)
+            if okp and type(pets) == "table" and #pets > 0 then
+                table.sort(pets, function(a, b) return (tonumber(a.stat) or 0) > (tonumber(b.stat) or 0) end)
+                table.sort(slotList, function(a, b) return a.Name < b.Name end)
+                for i, slot in ipairs(slotList) do
+                    pay[slot] = tonumber(pets[i] and pets[i].stat) or 0
                 end
             end
         end
@@ -578,7 +606,7 @@ function ACT.petUpgrade()
         end
     end
 
-    fire("BasePetsRequest", "PlaceBest")
+    if CFG.autoPlaceBest then fire("BasePetsRequest", "PlaceBest") end
     HITS.pet = HITS.pet + 1
     if pressed > 0 then log("upgraded " .. pressed .. " slots") end
     return pressed, #signs, skipped
@@ -635,54 +663,36 @@ function PAD.reset()
     PAD.snaps = 0
 end
 
+-- jump pad: never moves the player. it only reacts when the game shows the jump
+-- meter, which it signals by relabelling KickButton to "JUMP!".
+function PAD.meterActive()
+    local hud = frame("Game", "HUD", "HUDFrame")
+    local kb = hud and hud:FindFirstChild("KickButton")
+    if not kb then return nil end
+    local tl = kb:FindFirstChildOfClass("TextLabel")
+    local txt = string.upper(tostring(tl and tl.Text or ""))
+    return string.find(txt, "JUMP", 1, true) ~= nil, kb
+end
+
 function PAD.hold()
-    local target = PAD.coords()
-    local char = player.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not (target and hrp and hum) then return "nochar" end
-
-    local d = hrp.Position - target
-    local off = math.sqrt(d.X * d.X + d.Z * d.Z)
-    if off <= math.min(CFG.padLeash, 18) then
-        PAD.fails = 0
-        return "onpad"
-    end
-
-    -- single teleport, only the first time this session is armed
-    if not PAD.tpDone then
-        PAD.tpDone = true
-        pcall(function() hrp.CFrame = CFrame.new(target) end)
+    local active, kb = PAD.meterActive()
+    if not active then return "idle" end
+    -- meter is up: take the perfect attempt, nothing else
+    if os.clock() - (PAD.lastPress or 0) > 0.35 then
+        PAD.lastPress = os.clock()
+        pcall(firesignal, kb.Activated)
+        pcall(firesignal, kb.MouseButton1Click)
         PAD.snaps = PAD.snaps + 1
-        return "tped"
+        return "jump"
     end
-
-    -- after that: walk only, never set CFrame
-    local ok = pcall(function()
-        hum.WalkSpeed = math.max(hum.WalkSpeed, CFG.padSpeed)
-        hum:MoveTo(target)
-    end)
-    if ok then
-        PAD.snaps = PAD.snaps + 1
-        PAD.fails = PAD.fails + 1
-        return "walking"
-    end
-    return "failed"
+    return "meter"
 end
 
 local function padLoop()
-    while true do
+    while alive() do
         if CFG.running and CFG.autoJump then
             local state = PAD.hold()
-            if state == "tped" then log("tp to pad (once)")
-            elseif state == "walking" then
-                log("walking back")
-                if PAD.fails >= CFG.padFailsBeforeSpeed then
-                    PAD.fails = 0
-                    ACT.buySpeed()
-                    log("speed up (wave too fast)")
-                end
-            end
+            if state == "jump" then log("jump pad: perfect attempt") end
             task.wait(0.6)
         else
             PAD.tpDone = false
@@ -901,7 +911,7 @@ local thr = { i = CFG.throwInterval, stall = 0 }
 local L = { rebirth=0, world=0, collect=0, place=0, weight=0, speed=0, trail=0, pet=0, save=0 }
 
 local function throwLoop()
-    while true do
+    while alive() do
         if not CFG.running or not CFG.autoThrow or CFG.throwMode == "off" or not S.ready() then
             task.wait(0.4)
         else
@@ -942,7 +952,7 @@ local function trainLoop()
 end
 
 local function mainLoop()
-    while true do
+    while alive() do
         if CFG.running and S.ready() then
             local t = os.clock()
             if CFG.autoWorld then
@@ -999,7 +1009,7 @@ end
 
 local watch = { p = 0, tick = os.clock(), pps = 0, last = os.clock() }
 local function watchdogLoop()
-    while true do
+    while alive() do
         task.wait(5)
         if CFG.watchdog and CFG.running then
             local p, now = S.power(), os.clock()
@@ -1321,9 +1331,6 @@ do
             log("auto jump off")
         end
     end)
-    switchRow(p, "auto steer lane", "autoSteer", function(on)
-        log("auto lane " .. (on and "on" or "off"))
-    end)
     switchRow(p, "auto rebirth", "autoRebirth")
     sectionLabel(p, "economy")
     switchRow(p, "auto collect cash", "autoCollect")
@@ -1557,6 +1564,28 @@ local function fmt(n)
     return string.format("%.0f", n)
 end
 
+local function repaintSwitches()
+    for _, page in pairs(pages) do
+        for _, row in ipairs(page:GetChildren()) do
+            if row:IsA("Frame") and row:GetAttribute("Key") then
+                local key = row:GetAttribute("Key")
+                local lbl = row:FindFirstChild("TextLabel")
+                local track = row:FindFirstChild("Frame")
+                local on = CFG[key] == true
+                if lbl then lbl.TextColor3 = on and T.text or T.dim end
+                if track then
+                    track.BackgroundColor3 = on and T.accent or T.line
+                    local knob = track:FindFirstChild("Frame")
+                    if knob then
+                        knob.Position = UDim2.fromOffset(on and 16 or 2, 2)
+                        knob.BackgroundColor3 = on and T.bg or T.dim
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function renderLoop()
     local tick = 0
     while true do
@@ -1565,6 +1594,19 @@ local function renderLoop()
         STAT.Text = string.format("%s  |  pps %s/s  |  lift %.1f  |  %s",
             fmt(S.power()), fmt(watch.pps), S.lift(), S.world())
         LOGB.Text = LOG[1] or "ready"
+        repaintSwitches()
+        -- debug: expose live CFG so toggles can be verified from outside
+        if os.clock() - (lastDbg or 0) > 1 then
+            lastDbg = os.clock()
+            pcall(function()
+                local parts = {}
+                for k, v in pairs(CFG) do
+                    if type(v) == "boolean" then parts[#parts+1] = k .. "=" .. tostring(v) end
+                end
+                table.sort(parts)
+                writefile("JFC_debug.txt", table.concat(parts, "\n"))
+            end)
+        end
         tick = tick + 1
         task.wait(0.4)
     end
