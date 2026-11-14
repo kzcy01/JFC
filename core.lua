@@ -873,6 +873,22 @@ local function sweepJumpPopups()
     end
 end
 
+-- fuse reveal: the Result card pops after every fuse and sits until
+-- claimed. "Nice" claims + closes, "Again" re-fuses into cooldown.
+-- tap Nice the moment it shows so the screen never waits on it.
+local function sweepFuseReveal()
+    local fg = playerGui and playerGui:FindFirstChild("FuseMachineGui")
+    local res = fg and fg:FindFirstChild("Result")
+    if not (res and res.Visible) then return end
+    for _, n in ipairs({ "Nice", "Again" }) do
+        local b = res:FindFirstChild(n)
+        if b and b:IsA("GuiButton") and b.Visible then
+            if press(b) then log("claimed fuse reveal") end
+            return
+        end
+    end
+end
+
 -- jump pad: never moves the player. it only reacts when the game shows the jump
 -- meter, which it signals by relabelling KickButton to "JUMP!".
 function PAD.meterActive()
@@ -1315,6 +1331,7 @@ local function mainLoop()
                 local n = ACT.fuse()
                 if n and n > 0 then log("fused " .. n) end
             end
+            sweepFuseReveal()
             if t - L.save > 30 then L.save = t saveCfg() end
         end
         task.wait(0.4)
