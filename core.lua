@@ -37,7 +37,7 @@ local CFG = {
     autoBuySpeed = true, speedEvery = 22,
     autoBuyTrail = true, trailEvery = 30,
     autoPetUpgrade = true, petEvery = 18,
-    autoFuse = true, fuseEvery = 25, fuseBurst = 3,
+    autoFuse = true, fuseEvery = 9, fuseBurst = 1,
     -- off by default
     autoRebirth = true,
     autoWorld = true,
@@ -503,26 +503,49 @@ function ACT.buyTrail()
     return n > 0
 end
 
+local FUSE_MACHINE = Vector3.new(85, 21, 43)
+local FUSE_TRIP_UNTIL = 0
+
 function ACT.fuse()
-    -- weakest-two-first: FuseGetPets -> sort by stat -> FuseRequest {uidA, uidB}
+    -- fuse runs AT the machine (85,21,43): the server rejects remote
+    -- fuses ("Walk up to the Fuse Machine") and rate-limits to ~1 per 6s
+    -- ("The machine is still running"). so: one precise attempt per
+    -- cycle, every 7s, weakest-first pair. auto-trips to the machine
+    -- when far (pad loop yields via FUSE_TRIP_UNTIL), stays while chaining.
     local r = R:FindFirstChild("FuseGetPets")
     local fr = R:FindFirstChild("FuseRequest")
     if not (r and fr) then return 0 end
     local ok, pets = pcall(function() return r:InvokeServer() end)
     if not ok or type(pets) ~= "table" or #pets < 2 then return 0 end
     table.sort(pets, function(a, b) return (tonumber(a.stat) or 0) < (tonumber(b.stat) or 0) end)
-    local done = 0
-    local i = 1
-    while i + 1 <= #pets and done < (CFG.fuseBurst or 3) do
-        local a, b = pets[i], pets[i + 1]
-        if a.uid and b.uid then
-            local ok2 = pcall(function() fr:InvokeServer({ a.uid, b.uid }) end)
-            if ok2 then done = done + 1 end
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return 0 end
+    if (hrp.Position - FUSE_MACHINE).Magnitude > 14 then
+        FUSE_TRIP_UNTIL = os.clock() + 25
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function() hum.Jump = true end)
+            task.wait(0.2)
+            pcall(function() hum:MoveTo(FUSE_MACHINE) end)
         end
-        i = i + 2
+        return 0
     end
-    HITS.fuse = (HITS.fuse or 0) + done
-    return done
+    local a, b = pets[1], pets[2]
+    if not (a.uid and b.uid) then return 0 end
+    local ok2, res = pcall(function() return fr:InvokeServer({ a.uid, b.uid }) end)
+    if ok2 and type(res) == "table" and res.ok == true then
+        FUSE_TRIP_UNTIL = os.clock() + 8
+        HITS.fuse = (HITS.fuse or 0) + 1
+        log("fused 1")
+        return 1
+    end
+    -- "still running" = cooldown not expired yet: stay put, retry next cycle
+    if ok2 and type(res) == "table" and string.find(tostring(res.message), "still running", 1, true) then
+        FUSE_TRIP_UNTIL = os.clock() + 8
+        return 0
+    end
+    return 0
 end
 
 function ACT.petUpgrade()
@@ -719,6 +742,7 @@ local JFPATH = { legs = nil, legIdx = 1, dest = nil, lastComp = 0 }
 
 local function jumpWalkTo(target)
     if PAD.manualUntil and os.clock() < PAD.manualUntil then return true end
+    if os.clock() < (FUSE_TRIP_UNTIL or 0) then return true end
     local c = player.Character
     local hum = c and c:FindFirstChildOfClass("Humanoid")
     if not (c and hum) then return false end
@@ -802,6 +826,7 @@ end
 -- so a single synthetic press works (proven live: 371m in one press).
 local function jumpTpHome()
     if PAD.manualUntil and os.clock() < PAD.manualUntil then return false end
+    if os.clock() < (FUSE_TRIP_UNTIL or 0) then return false end
     if os.clock() - (PAD.lastTp or 0) < 10 then return false end
     local hud = frame("Game", "HUD", "HUDFrame")
     local tp = hud and hud:FindFirstChild("TpHome")
@@ -1097,6 +1122,10 @@ function LANE.bind()
     if steerBound then return end
     steerBound = true
     RUN:BindToRenderStep("JFC_steer", Enum.RenderPriority.Camera.Value + 25, function()
+        if not alive() then
+            pcall(function() RUN:UnbindFromRenderStep("JFC_steer") end)
+            return
+        end
         if not (CFG.running and CFG.autoSteer) then return end
         local char = player.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -1115,7 +1144,7 @@ end
 
 local function laneLoop()
     LANE.bind()
-    while true do
+    while alive() do
         if CFG.running and CFG.autoSteer then
             LANE.publish()
             task.wait(0.08)
@@ -1220,7 +1249,7 @@ end
 
 local function trainLoop()
     local last = 0
-    while true do
+    while alive() do
         if CFG.running and CFG.autoTrain and S.ready() then
             local live = ACT.osu()
             if not live and os.clock() - last > 1.2 then
@@ -1793,6 +1822,8 @@ BTN_FOLD.MouseButton1Click:Connect(function()
     BTN_FOLD.Text = folded and "+" or "-"
 end)
 
+if not getgenv().JFC_KEYS then
+getgenv().JFC_KEYS = true
 UIS.InputBegan:Connect(function(i, processed)
     if processed then return end
     if i.KeyCode == Enum.KeyCode.Escape then
@@ -1809,6 +1840,7 @@ UIS.InputBegan:Connect(function(i, processed)
         log(CFG.running and "resumed" or "paused")
     end
 end)
+end
 
 local function repaintAll()
     for _, page in pairs(pages) do
@@ -1873,7 +1905,7 @@ end
 
 local function renderLoop()
     local tick = 0
-    while true do
+    while alive() do
         STATE.Text = CFG.running and "run" or "pause"
         STATE.TextColor3 = CFG.running and T.accent or T.warn
         STAT.Text = string.format("%s  |  pps %s/s  |  lift %.1f  |  %s",
