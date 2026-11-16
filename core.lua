@@ -609,6 +609,55 @@ function ACT.redeemFile()
     return n
 end
 
+local UNIVERSE = 10767621216
+local CODE_STOPWORDS = {
+    use = true, the = true, code = true, codes = true, new = true, free = true,
+    valid = true, expired = true, below = true, here = true, all = true,
+}
+
+function ACT.findCodes()
+    -- pull the live game description from Roblox's own API and scrape
+    -- anything shaped like a promo code ("USE CODE: X", "CODE: X", etc).
+    -- never guesses: only token patterns following the word code/codes.
+    local ok, res = pcall(function()
+        return game:HttpGet("https://games.roblox.com/v1/games?universeIds=" .. tostring(UNIVERSE))
+    end)
+    if not ok then
+        log("codes: fetch failed")
+        return {}
+    end
+    local ok2, data = pcall(function() return Http:JSONDecode(res) end)
+    if not (ok2 and type(data) == "table" and data.data and data.data[1]) then
+        log("codes: bad payload")
+        return {}
+    end
+    local desc = tostring(data.data[1].description or "")
+    local found, seen = {}, {}
+    for code in string.gmatch(desc, "[Cc][Oo][Dd][Ee][Ss]?%s*[:%-]?%s*([%w_]+)") do
+        local c = tostring(code)
+        local low = string.lower(c)
+        if #c >= 3 and #c <= 24 and not CODE_STOPWORDS[low] and not seen[low] then
+            seen[low] = true
+            found[#found + 1] = c
+        end
+    end
+    if #found == 0 then log("codes: none in description") end
+    return found
+end
+
+function ACT.redeemFound()
+    -- scrape then claim anything new. one attempt each, ever.
+    local found = ACT.findCodes()
+    local n = 0
+    for _, c in ipairs(found) do
+        if not CODES_TRIED[string.lower(c)] then
+            if ACT.redeem(c) then n = n + 1 end
+            task.wait(0.8)
+        end
+    end
+    return n, #found
+end
+
 function ACT.petUpgrade()
     -- walk every SlotUpgradeSign on my plot, read its price, pair it with the pet's
     -- pay, then upgrade the richest non-MAX slots first.
@@ -1395,6 +1444,7 @@ local function mainLoop()
             if CFG.autoRedeem and t - (L.redeem or 0) > CFG.redeemEvery then
                 L.redeem = t
                 ACT.redeemFile()
+                ACT.redeemFound()
             end
             sweepFuseReveal()
             if t - L.save > 30 then L.save = t saveCfg() end
@@ -1704,6 +1754,7 @@ end
 
 -- code row: textbox left, redeem button right
 local CODEBOX = nil
+local CODESTAT = nil
 local function codeRow(parent)
     local row = Instance.new("Frame")
     row.BackgroundTransparency = 1
@@ -1737,6 +1788,25 @@ local function codeRow(parent)
     end)
     CODEBOX = box
     return row
+end
+
+-- one-line status under the code controls so results are readable
+local function statusLabel(parent)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Font, l.TextSize = T.font, 10
+    l.TextColor3 = T.dim
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    l.Text = "codes: idle"
+    l.Parent = parent
+    stack(parent, l, 16)
+    CODESTAT = l
+    return l
+end
+
+local function setCodeStatus(msg)
+    if CODESTAT then CODESTAT.Text = "codes: " .. tostring(msg) end
 end
 
 -- pages
@@ -1791,7 +1861,16 @@ do
                    {"fuse", 54, function() local n = ACT.fuse(); log("fused " .. tostring(n)) end} })
     sectionLabel(p, "codes")
     codeRow(p)
-    buttonRow(p, { {"redeem file", 96, function() local n = ACT.redeemFile(); log("codes claimed " .. n) end} })
+    statusLabel(p)
+    buttonRow(p, { {"find + redeem", 104, function()
+                        setCodeStatus("scanning description...")
+                        local n, total = ACT.redeemFound()
+                        setCodeStatus(n .. " claimed / " .. tostring(total) .. " found")
+                    end},
+                   {"redeem file", 88, function()
+                        local n = ACT.redeemFile()
+                        setCodeStatus(n .. " claimed from file")
+                    end} })
     switchRow(p, "auto redeem file", "autoRedeem")
 end
 
