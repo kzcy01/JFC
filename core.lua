@@ -38,6 +38,7 @@ local CFG = {
     autoBuyTrail = true, trailEvery = 30,
     autoPetUpgrade = true, petEvery = 18,
     autoFuse = true, fuseEvery = 9, fuseBurst = 1,
+    autoRedeem = true, redeemEvery = 60,
     -- off by default
     autoRebirth = true,
     autoWorld = true,
@@ -559,6 +560,53 @@ function ACT.fuse()
         return 0
     end
     return 0
+end
+
+local CODES_TRIED_FILE = "JFC_codes_tried.txt"
+local CODES_TRIED = {}
+do
+    local ok, raw = pcall(readfile, CODES_TRIED_FILE)
+    if ok and type(raw) == "string" then
+        for line in string.gmatch(raw, "[^\r\n]+") do
+            local c = line:gsub("^%s+", ""):gsub("%s+$", "")
+            if #c > 0 then CODES_TRIED[string.lower(c)] = true end
+        end
+    end
+end
+
+function ACT.redeem(code)
+    -- official promo codes only: plain string in -> {ok, message} out.
+    -- each code is tried once ever (tracked in JFC_codes_tried.txt).
+    local c = tostring(code or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if #c == 0 then return false end
+    if CODES_TRIED[string.lower(c)] then return false end
+    CODES_TRIED[string.lower(c)] = true
+    pcall(appendfile, CODES_TRIED_FILE, c .. "\n")
+    local r = R:FindFirstChild("RedeemCode")
+    if not r then log("redeem: no remote") return false end
+    local ok, res = pcall(function() return r:InvokeServer(c) end)
+    if ok and type(res) == "table" and res.ok == true then
+        log("code " .. c .. ": " .. tostring(res.message or "claimed"))
+        return true
+    end
+    log("code " .. c .. ": " .. tostring(type(res) == "table" and res.message or res))
+    return false
+end
+
+function ACT.redeemFile()
+    -- one code per line in JFC_codes.txt (Workspace root, # = comment).
+    -- skips anything already tried; 0.6s between attempts.
+    local ok, raw = pcall(readfile, "JFC_codes.txt")
+    if not (ok and type(raw) == "string") then return 0 end
+    local n = 0
+    for line in string.gmatch(raw, "[^\r\n]+") do
+        local c = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if #c > 0 and string.sub(c, 1, 1) ~= "#" and not CODES_TRIED[string.lower(c)] then
+            if ACT.redeem(c) then n = n + 1 end
+            task.wait(0.6)
+        end
+    end
+    return n
 end
 
 function ACT.petUpgrade()
@@ -1344,6 +1392,10 @@ local function mainLoop()
                 local n = ACT.fuse()
                 if n and n > 0 then log("fused " .. n) end
             end
+            if CFG.autoRedeem and t - (L.redeem or 0) > CFG.redeemEvery then
+                L.redeem = t
+                ACT.redeemFile()
+            end
             sweepFuseReveal()
             if t - L.save > 30 then L.save = t saveCfg() end
         end
@@ -1650,6 +1702,43 @@ local function buttonRow(parent, items)
     return row
 end
 
+-- code row: textbox left, redeem button right
+local CODEBOX = nil
+local function codeRow(parent)
+    local row = Instance.new("Frame")
+    row.BackgroundTransparency = 1
+    row.Parent = parent
+    stack(parent, row, 24)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -84, 1, 0)
+    box.BackgroundColor3 = T.raised
+    box.BorderSizePixel = 0
+    box.Font, box.TextSize = T.font, 11
+    box.TextColor3 = T.text
+    box.PlaceholderText = "paste code..."
+    box.Text = ""
+    box.ClearTextOnFocus = false
+    box.Parent = row
+    corner(box, 5)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(78, 24)
+    b.Position = UDim2.new(1, -78, 0, 0)
+    b.BackgroundColor3 = T.raised
+    b.BorderSizePixel = 0
+    b.Font, b.TextSize = T.font, 11
+    b.TextColor3 = T.dim
+    b.Text = "redeem"
+    b.AutoButtonColor = false
+    b.Parent = row
+    corner(b, 5)
+    b.MouseButton1Click:Connect(function()
+        local c = tostring(box.Text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if #c > 0 then ACT.redeem(c) end
+    end)
+    CODEBOX = box
+    return row
+end
+
 -- pages
 makeTab("auto",  0.28, 0)
 makeTab("shops", 0.28, 0)
@@ -1700,6 +1789,10 @@ do
                    {"trails", 62, function() ACT.buyTrail() end},
                    {"pets", 54, function() ACT.petUpgrade() end},
                    {"fuse", 54, function() local n = ACT.fuse(); log("fused " .. tostring(n)) end} })
+    sectionLabel(p, "codes")
+    codeRow(p)
+    buttonRow(p, { {"redeem file", 96, function() local n = ACT.redeemFile(); log("codes claimed " .. n) end} })
+    switchRow(p, "auto redeem file", "autoRedeem")
 end
 
 do
